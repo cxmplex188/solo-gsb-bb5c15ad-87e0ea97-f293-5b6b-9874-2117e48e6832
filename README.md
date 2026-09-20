@@ -80,6 +80,16 @@ docker compose up --build
 集合与锁集合自预演以来未变化才真正落库，否则 `409 STALE_REVISION_PREVIEW`、
 不写任何数据。令牌事实上一次性：成功提交后合同状态即变，同一 token 再用即失效。
 
+**最惠价合规审计（v1.7 起）**：`POST /contracts/{contract_no}/most-favored-audit`
+是纯只读的跨合同分析：在**同一认知时点** `known_at` 读取目标合同与全部同业合同的
+可见费率，以**所有合同业务区间边界的并集**把审计窗口切为连续片段逐段判定。只有
+目标与全部同业在该段都**唯一覆盖**时才下结论——以**同业最低费率**为 benchmark，
+目标费率超过 `benchmark × (1 + max_markup)` 标为 `violation`，否则 `compliant`
+（恰好等于上界为合规）；任一合同（目标或同业）出现 `gap` / `conflict`，该段一律
+标为 `inconclusive` 并逐一列出原因合同（`conflict` 附全部候选），**绝不臆断合规**。
+状态与依据完全相同的相邻段合并，响应汇总各状态的持续微秒数。审计全程不写任何数据。
+
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -571,6 +581,109 @@ curl -X POST http://localhost:8000/rates \
 }
 ```
 
+### 11. 最惠价合规审计 — `POST /contracts/{contract_no}/most-favored-audit`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/most-favored-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "peer_contract_nos": ["HT-2026-002", "HT-2026-003"],
+        "from": "2026-01-01T00:00:00Z",
+        "to":   "2027-01-01T00:00:00Z",
+        "known_at": "2026-06-01T00:00:00Z",
+        "max_markup": 0.25
+      }'
+```
+
+在**同一认知时点** `known_at` 读取目标合同（路径参数）与全部同业合同
+（`peer_contract_nos`）的可见费率，以**所有合同业务区间边界的并集**把审计窗口
+`[from, to)` 切分为连续片段，逐段判定：
+
+| `status` | 判定 |
+|---|---|
+| `compliant` | 目标与全部同业在该段均唯一覆盖，且目标费率 ≤ `benchmark × (1 + max_markup)`（恰好相等为合规，左闭） |
+| `violation` | 同上均唯一覆盖，但目标费率 **>** `benchmark × (1 + max_markup)` |
+| `inconclusive` | 任一合同（目标或同业）在该段为 `gap` 或 `conflict`，**不得误判合规** |
+
+- **benchmark** 恒为该段**同业最低费率**；多户同费率时按请求中同业顺序取最前者，
+  依据稳定。决定性片段附 `target_basis` / `benchmark_basis`（完整版本视图）、
+  `benchmark_contract_no`、`benchmark_rate`、`limit_rate`（合规上界）与 `target_rate`。
+- `inconclusive` 片段上述计价字段全部为 `null`，并在 `reasons` 中按“目标在前、
+  同业按请求顺序”逐一列出问题合同：`{contract_no, status, candidates}`，
+  其中 `status` 为 `gap` / `conflict`，`conflict` 时 `candidates` 附全部候选版本。
+- **合并规则**：状态与依据（目标版本 + benchmark 版本，或问题合同原因集合）完全
+  相同的相邻段合并为一段；费率相同但版本不同、或问题合同集合不同的相邻段不合并。
+- 每段附 `duration_us`；顶层 `summary` 汇总 `compliant_us` / `violation_us` /
+  `inconclusive_us`，三者合计恒等于审计窗口总时长。
+- 目标/同业合同不存在，或其费率在 `known_at` 尚不可见时，该合同自然表现为整窗
+  `gap`，对应片段全部 `inconclusive`，**不报 404**。
+- 接口**全程只读**：重复调用、被拒绝的请求均不产生任何版本、血缘边或锁记录。
+
+请求字段：`peer_contract_nos`、`from`、`to`、`known_at`、`max_markup` 均必填；
+窗口左闭右开；`max_markup` 必须为非负有限数值（允许 `0`，即不得高于同业最低）。
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| 审计完成（含 inconclusive 片段） | 200 | — |
+| `peer_contract_nos` 为空 | 422 | `EMPTY_PEER_CONTRACTS` |
+| 同业合同号重复 | 422 | `DUPLICATE_PEER_CONTRACTS` |
+| 目标合同混入同业列表 | 422 | `TARGET_CONTRACT_IN_PEERS` |
+| `from >= to` | 422 | `INVALID_INTERVAL` |
+| `max_markup` 为负 / 非有限数值 | 422 | `INVALID_REQUEST` |
+| 缺必填字段 / 空合同号 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+
+响应示例（目标全年 0.10；同业 HT-2026-002 上半年 0.08、下半年 0.06，
+HT-2026-003 全年 0.09；`max_markup=0.25`）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "peer_contract_nos": ["HT-2026-002", "HT-2026-003"],
+  "from": "2026-01-01T00:00:00.000000+00:00",
+  "to": "2027-01-01T00:00:00.000000+00:00",
+  "known_at": "2026-06-01T00:00:00.000000+00:00",
+  "max_markup": 0.25,
+  "segments": [
+    {"from": "2026-01-01T00:00:00.000000+00:00",
+     "to": "2026-04-01T00:00:00.000000+00:00",
+     "status": "compliant", "duration_us": 7776000000000,
+     "target_basis": {"rate_id": 1, "rate": 0.1, "version": 1, "...": "..."},
+     "benchmark_contract_no": "HT-2026-002",
+     "benchmark_basis": {"rate_id": 2, "rate": 0.08, "version": 1, "...": "..."},
+     "benchmark_rate": 0.08, "limit_rate": 0.1, "target_rate": 0.1,
+     "reasons": []},
+    {"from": "2026-04-01T00:00:00.000000+00:00",
+     "to": "2027-01-01T00:00:00.000000+00:00",
+     "status": "violation", "duration_us": 23760000000000,
+     "target_basis": {"rate_id": 1, "rate": 0.1, "version": 1, "...": "..."},
+     "benchmark_contract_no": "HT-2026-002",
+     "benchmark_basis": {"rate_id": 3, "rate": 0.06, "version": 2, "...": "..."},
+     "benchmark_rate": 0.06, "limit_rate": 0.075, "target_rate": 0.1,
+     "reasons": []}
+  ],
+  "summary": {"compliant_us": 7776000000000,
+              "violation_us": 23760000000000,
+              "inconclusive_us": 0}
+}
+```
+
+`inconclusive` 片段示例（同业 HT-2026-002 在 7 月起无可见费率，目标虽仍为 0.10
+但不下任何合规结论）：
+
+```json
+{
+  "from": "2026-07-01T00:00:00.000000+00:00",
+  "to": "2026-10-01T00:00:00.000000+00:00",
+  "status": "inconclusive", "duration_us": 7948800000000,
+  "target_basis": null, "benchmark_contract_no": null,
+  "benchmark_basis": null, "benchmark_rate": null,
+  "limit_rate": null, "target_rate": null,
+  "reasons": [
+    {"contract_no": "HT-2026-002", "status": "gap", "candidates": []}
+  ]
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -585,7 +698,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁）
+  logic.py     双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁、最惠价合规审计）
   db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

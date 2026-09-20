@@ -1,5 +1,6 @@
 """合同费率双时态追溯 API。"""
 
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -9,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import logic
 from .db import init_db
@@ -24,8 +25,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.6.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演（不写库）签发 state_token，POST /rates 携带 token 条件提交，保证预演与正式提交结果一致。",
+    version="1.7.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演（不写库）签发 state_token，POST /rates 携带 token 条件提交，保证预演与正式提交结果一致；最惠价合规审计在同一认知时点跨目标与同业合同切窗比对，任一方覆盖存疑即判 inconclusive，全程只读。",
     lifespan=lifespan,
 )
 
@@ -298,6 +299,90 @@ class RateRevisionPreviewResponse(BaseModel):
     blocking: Optional[RevisionPreviewBlocking] = Field(
         default=None, description="阻断原因；ready 时为 null"
     )
+
+
+class MostFavoredAuditRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    peer_contract_nos: list[str] = Field(
+        description="同业合同号列表（非空、不得重复、不得包含目标合同）；空列表由业务校验拒绝"
+    )
+    from_: datetime = Field(alias="from", description="审计窗口起点（含），ISO-8601")
+    to: datetime = Field(description="审计窗口终点（不含），ISO-8601")
+    known_at: datetime = Field(description="统一的认知时点，目标与同业均按此时点读取，ISO-8601")
+    max_markup: float = Field(description="允许的最大上浮比例（非负有限数值）；目标费率超过 benchmark×(1+max_markup) 即违规")
+
+    @field_validator("peer_contract_nos")
+    @classmethod
+    def _non_empty_contract_no(cls, value: list[str]) -> list[str]:
+        if any(not c or not c.strip() or len(c) > 128 for c in value):
+            raise ValueError("peer_contract_nos 中的合同号必须为 1–128 字的非空字符串")
+        return value
+
+    @field_validator("max_markup")
+    @classmethod
+    def _non_negative_finite(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("max_markup 必须是非负有限数值")
+        return value
+
+
+class MostFavoredReasonView(BaseModel):
+    contract_no: str = Field(description="存在 gap/conflict 的合同号（目标或同业）")
+    status: str = Field(description="gap / conflict")
+    candidates: list[VersionView] = Field(
+        default_factory=list, description="conflict 时该合同的全部候选版本；gap 时为空"
+    )
+
+
+class MostFavoredSegmentView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    status: str = Field(description="compliant / violation / inconclusive")
+    duration_us: int = Field(description="该片段的持续时长（微秒）")
+    target_basis: Optional[VersionView] = Field(
+        default=None, description="目标合同在该段的唯一费率依据；inconclusive 时为 null"
+    )
+    benchmark_contract_no: Optional[str] = Field(
+        default=None, description="benchmark（同业最低费率）所属合同号；inconclusive 时为 null"
+    )
+    benchmark_basis: Optional[VersionView] = Field(
+        default=None, description="benchmark 费率版本依据；inconclusive 时为 null"
+    )
+    benchmark_rate: Optional[float] = Field(
+        default=None, description="同业最低费率；inconclusive 时为 null"
+    )
+    limit_rate: Optional[float] = Field(
+        default=None, description="合规上界 benchmark×(1+max_markup)；inconclusive 时为 null"
+    )
+    target_rate: Optional[float] = Field(
+        default=None, description="目标合同该段费率；inconclusive 时为 null"
+    )
+    reasons: list[MostFavoredReasonView] = Field(
+        default_factory=list,
+        description="inconclusive 时各问题合同的原因（gap/conflict，conflict 附候选）；其他状态为空",
+    )
+
+
+class MostFavoredSummary(BaseModel):
+    compliant_us: int = Field(description="合规片段总时长（微秒）")
+    violation_us: int = Field(description="违规片段总时长（微秒）")
+    inconclusive_us: int = Field(description="无法判定（任一合同 gap/conflict）片段总时长（微秒）")
+
+
+class MostFavoredAuditResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    contract_no: str
+    peer_contract_nos: list[str]
+    from_: str = Field(alias="from", description="审计窗口起点（含）")
+    to: str = Field(description="审计窗口终点（不含）")
+    known_at: str = Field(description="实际使用的认知时点")
+    max_markup: float
+    segments: list[MostFavoredSegmentView]
+    summary: MostFavoredSummary = Field(description="各状态的持续微秒数汇总")
 
 
 def to_view(row: sqlite3.Row) -> VersionView:
@@ -726,4 +811,74 @@ def list_rate_locks(contract_no: str):
     return RateLockListResponse(
         contract_no=contract_no,
         locks=[to_lock_view(r) for r in logic.get_rate_locks(contract_no)],
+    )
+
+
+@app.post(
+    "/contracts/{contract_no}/most-favored-audit",
+    response_model=MostFavoredAuditResponse,
+)
+def most_favored_audit(contract_no: str, payload: MostFavoredAuditRequest):
+    """最惠价合规审计（全程只读）：在**同一认知时点**读取目标合同与全部同业合同的
+    可见费率，以所有合同业务区间边界的并集把审计窗口切为连续片段逐段判定。
+
+    - 目标与全部同业在该段均唯一覆盖：以**同业最低费率**为 benchmark，
+      目标费率超过 benchmark×(1+max_markup) 标为 `violation`，否则 `compliant`；
+    - 任一合同在该段存在 gap 或 conflict：该段标为 `inconclusive` 并逐一列出
+      原因合同（conflict 附全部候选），此时不臆断合规或违规。
+
+    状态与依据完全相同的相邻段合并；summary 汇总各状态持续微秒数。"""
+    try:
+        result = logic.compute_most_favored_audit(
+            contract_no=contract_no,
+            peer_contract_nos=payload.peer_contract_nos,
+            from_dt=payload.from_,
+            to_dt=payload.to,
+            known_at=payload.known_at,
+            max_markup=payload.max_markup,
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.InvalidPeerAuditError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": exc.code, "message": str(exc)},
+        )
+
+    def segment_view(seg: dict) -> MostFavoredSegmentView:
+        return MostFavoredSegmentView(
+            from_=seg["from"],
+            to=seg["to"],
+            status=seg["status"],
+            duration_us=seg["duration_us"],
+            target_basis=to_view(seg["target_basis"]) if seg["target_basis"] is not None else None,
+            benchmark_contract_no=seg["benchmark_contract_no"],
+            benchmark_basis=(
+                to_view(seg["benchmark_basis"]) if seg["benchmark_basis"] is not None else None
+            ),
+            benchmark_rate=seg["benchmark_rate"],
+            limit_rate=seg["limit_rate"],
+            target_rate=seg["target_rate"],
+            reasons=[
+                MostFavoredReasonView(
+                    contract_no=r["contract_no"],
+                    status=r["status"],
+                    candidates=[to_view(row) for row in r["candidates"]],
+                )
+                for r in seg["reasons"]
+            ],
+        )
+
+    return MostFavoredAuditResponse(
+        contract_no=result["contract_no"],
+        peer_contract_nos=result["peer_contract_nos"],
+        from_=result["from"],
+        to=result["to"],
+        known_at=result["known_at"],
+        max_markup=result["max_markup"],
+        segments=[segment_view(seg) for seg in result["segments"]],
+        summary=MostFavoredSummary(**result["summary"]),
     )

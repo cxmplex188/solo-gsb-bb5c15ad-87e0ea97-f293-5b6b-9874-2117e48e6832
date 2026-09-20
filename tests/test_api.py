@@ -2020,3 +2020,477 @@ def test_token_commit_uses_preview_recorded_at_when_omitted(client):
                   state_token=body["state_token"])
     assert r.status_code == 201, r.text
     assert r.json()["created"]["recorded_at"] == preview_ra
+
+
+# ---------- 最惠价合规审计 ----------
+
+def post_audit(client, contract, **kw):
+    return client.post(f"/contracts/{contract}/most-favored-audit", json=kw)
+
+
+def _audit_window():
+    return {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"}
+
+
+def test_mfa_mixed_compliant_and_violation(client):
+    """目标 0.10 全年；同业 P1 上半年 0.08 / 下半年 0.06，P2 全年 0.09；
+    max_markup=0.25：上半段恰好等于上界 → compliant，下半段超限 → violation。"""
+    post_rate(client, contract_no="MF-1", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-1-P1", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-04-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-1-P1", rate=0.06,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    post_rate(client, contract_no="MF-1-P2", rate=0.09,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+
+    r = post_audit(client, "MF-1", peer_contract_nos=["MF-1-P1", "MF-1-P2"],
+                   known_at="2026-06-01T00:00:00Z", max_markup=0.25,
+                   **_audit_window())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["contract_no"] == "MF-1"
+    assert data["peer_contract_nos"] == ["MF-1-P1", "MF-1-P2"]
+    assert data["from"] == "2026-01-01T00:00:00.000000+00:00"
+    assert data["to"] == "2027-01-01T00:00:00.000000+00:00"
+    assert data["known_at"] == "2026-06-01T00:00:00.000000+00:00"
+    assert data["max_markup"] == 0.25
+
+    segs = data["segments"]
+    assert [(s["from"], s["to"], s["status"]) for s in segs] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2026-04-01T00:00:00.000000+00:00", "compliant"),
+        ("2026-04-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", "violation"),
+    ]
+    # 片段连续铺满窗口
+    assert segs[0]["from"] == data["from"] and segs[-1]["to"] == data["to"]
+    for prev, nxt in zip(segs, segs[1:]):
+        assert prev["to"] == nxt["from"]
+
+    first, second = segs
+    # 上半段：benchmark 0.08 × 1.25 = 0.10，目标 0.10 恰好等于上界 → compliant（左闭）
+    assert first["target_rate"] == 0.10
+    assert first["benchmark_contract_no"] == "MF-1-P1"
+    assert first["benchmark_rate"] == 0.08
+    assert first["limit_rate"] == pytest.approx(0.10)
+    assert first["target_basis"]["rate"] == 0.10
+    assert first["benchmark_basis"]["contract_no"] == "MF-1-P1"
+    assert first["benchmark_basis"]["rate"] == 0.08
+    assert first["reasons"] == []
+    # 下半段：benchmark 0.06（同业最低）× 1.25 = 0.075，目标 0.10 超限 → violation
+    assert second["target_rate"] == 0.10
+    assert second["benchmark_contract_no"] == "MF-1-P1"
+    assert second["benchmark_rate"] == 0.06
+    assert second["limit_rate"] == pytest.approx(0.075)
+    assert second["benchmark_basis"]["rate"] == 0.06
+    assert second["reasons"] == []
+
+    jan, apr, jan2 = ("2026-01-01T00:00:00Z", "2026-04-01T00:00:00Z",
+                      "2027-01-01T00:00:00Z")
+    assert first["duration_us"] == us_between(jan, apr)
+    assert second["duration_us"] == us_between(apr, jan2)
+    assert data["summary"] == {
+        "compliant_us": us_between(jan, apr),
+        "violation_us": us_between(apr, jan2),
+        "inconclusive_us": 0,
+    }
+    assert sum(s["duration_us"] for s in segs) == us_between(jan, jan2)
+
+    # 决定性片段字段集合固定（inconclusive 专用字段为 null/空）
+    assert set(first) == {
+        "from", "to", "status", "duration_us", "target_basis",
+        "benchmark_contract_no", "benchmark_basis", "benchmark_rate",
+        "limit_rate", "target_rate", "reasons",
+    }
+
+
+def test_mfa_equal_to_limit_is_compliant_slightly_over_is_violation(client):
+    """目标费率恰好等于 benchmark×(1+max_markup) 为 compliant；上浮比例调小即 violation。"""
+    post_rate(client, contract_no="MF-2", rate=0.12,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-2-P", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    kw = dict(peer_contract_nos=["MF-2-P"], known_at="2026-02-01T00:00:00Z",
+              **_audit_window())
+
+    ok = post_audit(client, "MF-2", max_markup=0.2, **kw).json()
+    (seg,) = ok["segments"]
+    assert seg["status"] == "compliant"
+    assert seg["limit_rate"] == pytest.approx(0.12)
+
+    bad = post_audit(client, "MF-2", max_markup=0.19, **kw).json()
+    (seg,) = bad["segments"]
+    assert seg["status"] == "violation"
+
+    # max_markup=0：要求不高于同业最低，0.12 > 0.10 → violation
+    zero = post_audit(client, "MF-2", max_markup=0.0, **kw).json()
+    assert zero["segments"][0]["status"] == "violation"
+
+
+def test_mfa_splits_on_union_of_all_boundaries(client):
+    """以所有合同业务边界的并集切窗；同为 violation 但 benchmark 依据不同的相邻段不合并。"""
+    post_rate(client, contract_no="MF-3", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-3-P1", rate=0.09,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-3-P1", rate=0.07,
+              valid_from="2026-06-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    post_rate(client, contract_no="MF-3-P2", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_audit(client, "MF-3", peer_contract_nos=["MF-3-P1", "MF-3-P2"],
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0,
+                      **_audit_window()).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["violation", "violation"]
+    # 上半年 benchmark 是 P2 的 0.08，下半年切换为 P1 的 0.07 → 依据不同，不合并
+    assert (segs[0]["from"], segs[0]["to"], segs[0]["benchmark_rate"]) == (
+        "2026-01-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00", 0.08)
+    assert segs[0]["benchmark_contract_no"] == "MF-3-P2"
+    assert (segs[1]["from"], segs[1]["to"], segs[1]["benchmark_rate"]) == (
+        "2026-06-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", 0.07)
+    assert segs[1]["benchmark_contract_no"] == "MF-3-P1"
+    assert sum(data["summary"].values()) == us_between(
+        "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z")
+
+
+def test_mfa_benchmark_is_min_peer_with_stable_tie_break(client):
+    """benchmark 取同业最低费率；多户同费率时按请求中的同业顺序取最前者。"""
+    post_rate(client, contract_no="MF-4", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    for peer, rate in [("MF-4-PA", 0.08), ("MF-4-PB", 0.06), ("MF-4-PC", 0.07)]:
+        post_rate(client, contract_no=peer, rate=rate,
+                  valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+                  recorded_at="2026-01-01T00:00:00Z")
+    kw = dict(known_at="2026-02-01T00:00:00Z", max_markup=1.0, **_audit_window())
+    (seg,) = post_audit(client, "MF-4",
+                        peer_contract_nos=["MF-4-PA", "MF-4-PB", "MF-4-PC"],
+                        **kw).json()["segments"]
+    assert seg["benchmark_rate"] == 0.06
+    assert seg["benchmark_contract_no"] == "MF-4-PB"
+    assert seg["status"] == "compliant"  # 0.10 <= 0.06×2
+
+    # 并列最低：按请求顺序取靠前的合同
+    post_rate(client, contract_no="MF-4-PD", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    first_order = post_audit(
+        client, "MF-4", peer_contract_nos=["MF-4-PA", "MF-4-PD"], **kw).json()
+    assert first_order["segments"][0]["benchmark_contract_no"] == "MF-4-PA"
+    reversed_order = post_audit(
+        client, "MF-4", peer_contract_nos=["MF-4-PD", "MF-4-PA"], **kw).json()
+    assert reversed_order["segments"][0]["benchmark_contract_no"] == "MF-4-PD"
+    assert reversed_order["segments"][0]["benchmark_rate"] == 0.08
+
+
+def test_mfa_peer_gap_segment_inconclusive_and_not_judged(client):
+    """同业在某段无费率：该段 inconclusive、列出原因，即使目标覆盖也不给结论。"""
+    post_rate(client, contract_no="MF-5", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-5-P", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_audit(client, "MF-5", peer_contract_nos=["MF-5-P"],
+                      **{"from": "2026-01-01T00:00:00Z", "to": "2026-10-01T00:00:00Z"},
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["violation", "inconclusive"]
+    bad = segs[1]
+    assert (bad["from"], bad["to"]) == (
+        "2026-07-01T00:00:00.000000+00:00", "2026-10-01T00:00:00.000000+00:00")
+    # 不得误判：所有计价字段为 null，原因列出同业 gap
+    assert bad["target_rate"] is None
+    assert bad["target_basis"] is None
+    assert bad["benchmark_contract_no"] is None
+    assert bad["benchmark_basis"] is None
+    assert bad["benchmark_rate"] is None
+    assert bad["limit_rate"] is None
+    (reason,) = bad["reasons"]
+    assert reason == {"contract_no": "MF-5-P", "status": "gap", "candidates": []}
+    jul, oct_ = "2026-07-01T00:00:00Z", "2026-10-01T00:00:00Z"
+    assert bad["duration_us"] == us_between(jul, oct_)
+    assert data["summary"]["inconclusive_us"] == us_between(jul, oct_)
+
+
+def test_mfa_target_gap_segment_inconclusive(client):
+    """目标自身在某段无费率：同样 inconclusive，原因合同为目标合同。"""
+    post_rate(client, contract_no="MF-6", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-6-P", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_audit(client, "MF-6", peer_contract_nos=["MF-6-P"],
+                      **{"from": "2026-01-01T00:00:00Z", "to": "2026-10-01T00:00:00Z"},
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["violation", "inconclusive"]
+    (reason,) = segs[1]["reasons"]
+    assert reason["contract_no"] == "MF-6"
+    assert reason["status"] == "gap"
+    assert reason["candidates"] == []
+
+
+def test_mfa_conflict_inconclusive_lists_candidates(client):
+    """同业存在重叠冲突（脏数据）：冲突段 inconclusive 并附该同业全部候选。"""
+    post_rate(client, contract_no="MF-7", rate=0.20,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-7-P1", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-7-P2", rate=0.11,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('MF-7-P1', 0.99, '2026-06-01T00:00:00.000000+00:00', "
+            "        '2026-09-01T00:00:00.000000+00:00', "
+            "        '2026-02-01T00:00:00.000000+00:00', 2)"
+        )
+    data = post_audit(client, "MF-7", peer_contract_nos=["MF-7-P1", "MF-7-P2"],
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0,
+                      **_audit_window()).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["violation", "inconclusive", "violation"]
+    mid = segs[1]
+    assert (mid["from"], mid["to"]) == (
+        "2026-06-01T00:00:00.000000+00:00", "2026-09-01T00:00:00.000000+00:00")
+    assert mid["benchmark_rate"] is None and mid["target_rate"] is None
+    (reason,) = mid["reasons"]
+    assert reason["contract_no"] == "MF-7-P1"
+    assert reason["status"] == "conflict"
+    assert sorted((c["version"], c["rate"]) for c in reason["candidates"]) == [
+        (1, 0.10), (2, 0.99)]
+    # 两个 violation 段被 inconclusive 隔开，不合并
+    assert segs[0]["benchmark_rate"] == 0.10
+    assert segs[2]["benchmark_rate"] == 0.10
+    jun, sep = "2026-06-01T00:00:00Z", "2026-09-01T00:00:00Z"
+    assert mid["duration_us"] == us_between(jun, sep)
+    assert data["summary"]["inconclusive_us"] == us_between(jun, sep)
+
+
+def test_mfa_inconclusive_segments_split_and_merge_by_reasons(client):
+    """同一问题原因贯穿内部边界时合并为一段；原因不同（含无问题）时不合并。"""
+    # 目标全年分两段（同费率，边界来自目标）；同业 P 全年 gap：原因恒同 → 合并为单段
+    post_rate(client, contract_no="MF-8", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-8", rate=0.10,
+              valid_from="2026-07-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    data = post_audit(client, "MF-8", peer_contract_nos=["MF-8-PG"],
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0,
+                      **_audit_window()).json()
+    (seg,) = data["segments"]
+    assert seg["status"] == "inconclusive"
+    assert (seg["from"], seg["to"]) == (
+        "2026-01-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00")
+    assert [(r["contract_no"], r["status"]) for r in seg["reasons"]] == [
+        ("MF-8-PG", "gap")]
+
+    # 同业 P 仅覆盖年中：左右两段 gap 原因相同但不相邻（被决定性段隔开）→ 保留两段
+    post_rate(client, contract_no="MF-8-PC", rate=0.04,
+              valid_from="2026-04-01T00:00:00Z", valid_to="2026-10-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_audit(client, "MF-8", peer_contract_nos=["MF-8-PC"],
+                      **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0).json()
+    # 决定性区间内目标在 07-01 换版（费率同、版本不同）→ 依据不同，不合并
+    assert [s["status"] for s in data["segments"]] == [
+        "inconclusive", "violation", "violation", "inconclusive"]
+    assert [s["target_basis"]["version"] for s in data["segments"][1:3]] == [1, 2]
+    assert all(s["benchmark_rate"] == 0.04 for s in data["segments"][1:3])
+    assert all((r["contract_no"], r["status"]) == ("MF-8-PC", "gap")
+               for s in data["segments"] if s["status"] == "inconclusive"
+               for r in s["reasons"])
+
+
+def test_mfa_decisive_segments_merge_when_basis_unchanged(client):
+    """非 benchmark 同业在内部换版：目标与 benchmark 依据均不变 → 相邻段合并。"""
+    post_rate(client, contract_no="MF-9", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    # 最低同业 P1 全年单一版本
+    post_rate(client, contract_no="MF-9-P1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    # P2 年中换版（0.09 → 0.08），但始终不是最低
+    post_rate(client, contract_no="MF-9-P2", rate=0.09,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-9-P2", rate=0.08,
+              valid_from="2026-07-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    data = post_audit(client, "MF-9", peer_contract_nos=["MF-9-P1", "MF-9-P2"],
+                      known_at="2026-06-01T00:00:00Z", max_markup=1.0,
+                      **_audit_window()).json()
+    (seg,) = data["segments"]
+    assert seg["status"] == "compliant"
+    assert (seg["from"], seg["to"]) == (
+        "2026-01-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00")
+    assert seg["benchmark_contract_no"] == "MF-9-P1"
+    assert seg["benchmark_rate"] == 0.05
+    assert seg["duration_us"] == us_between(
+        "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z")
+
+
+def test_mfa_unknown_contracts_are_inconclusive_not_404(client):
+    """目标与同业均不存在：整窗 inconclusive，逐合同列 gap 原因，不报 404。"""
+    r = post_audit(client, "MF-GHOST", peer_contract_nos=["MF-GHOST-P"],
+                   known_at="2026-06-01T00:00:00Z", max_markup=0.1,
+                   **_audit_window())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    (seg,) = data["segments"]
+    assert seg["status"] == "inconclusive"
+    assert [(x["contract_no"], x["status"], x["candidates"]) for x in seg["reasons"]] == [
+        ("MF-GHOST", "gap", []), ("MF-GHOST-P", "gap", [])]
+    assert seg["target_rate"] is None and seg["benchmark_rate"] is None
+    assert data["summary"] == {
+        "compliant_us": 0, "violation_us": 0,
+        "inconclusive_us": us_between("2026-01-01T00:00:00Z",
+                                      "2027-01-01T00:00:00Z"),
+    }
+
+
+def test_mfa_respects_single_known_at(client):
+    """目标与同业按同一 known_at 读取：同业费率在该时点之后录入 → 不可见 → inconclusive。"""
+    post_rate(client, contract_no="MF-10", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-10-P", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-05-01T00:00:00Z")
+    kw = dict(peer_contract_nos=["MF-10-P"], max_markup=0.0, **_audit_window())
+
+    early = post_audit(client, "MF-10", known_at="2026-03-01T00:00:00Z", **kw).json()
+    (seg,) = early["segments"]
+    assert seg["status"] == "inconclusive"
+    assert [(r["contract_no"], r["status"]) for r in seg["reasons"]] == [
+        ("MF-10-P", "gap")]
+
+    late = post_audit(client, "MF-10", known_at="2026-06-01T00:00:00Z", **kw).json()
+    (seg,) = late["segments"]
+    assert seg["status"] == "violation"
+    assert seg["benchmark_rate"] == 0.08
+
+
+def test_mfa_multiple_reasons_listed_per_segment(client):
+    """同一段内多个合同都有问题：原因全部列出（目标在前、同业按请求顺序）。"""
+    # 目标只覆盖上半年；同业 P 只覆盖下半年 → 两段各自有问题
+    post_rate(client, contract_no="MF-11", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-07-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-11-P", rate=0.08,
+              valid_from="2026-07-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    data = post_audit(client, "MF-11", peer_contract_nos=["MF-11-P"],
+                      known_at="2026-06-01T00:00:00Z", max_markup=0.0,
+                      **_audit_window()).json()
+    segs = data["segments"]
+    assert [s["status"] for s in segs] == ["inconclusive", "inconclusive"]
+    # 原因集合不同（前：同业 gap；后：目标 gap）→ 不合并
+    assert [r["contract_no"] for r in segs[0]["reasons"]] == ["MF-11-P"]
+    assert [r["contract_no"] for r in segs[1]["reasons"]] == ["MF-11"]
+    assert data["summary"]["compliant_us"] == 0
+    assert data["summary"]["violation_us"] == 0
+    assert data["summary"]["inconclusive_us"] == us_between(
+        "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z")
+
+
+def test_mfa_invalid_inputs_422(client):
+    base = {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+            "known_at": "2026-06-01T00:00:00Z", "max_markup": 0.1}
+
+    r = post_audit(client, "MF-X", peer_contract_nos=[], **base)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "EMPTY_PEER_CONTRACTS"
+
+    r = post_audit(client, "MF-X", peer_contract_nos=["P", "P"], **base)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "DUPLICATE_PEER_CONTRACTS"
+
+    r = post_audit(client, "MF-X", peer_contract_nos=["MF-X"], **base)
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "TARGET_CONTRACT_IN_PEERS"
+
+    r = post_audit(client, "MF-X", peer_contract_nos=["P"],
+                   **{**base, "from": "2027-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+    r = post_audit(client, "MF-X", peer_contract_nos=["P"],
+                   **{**base, "to": "2026-01-01T00:00:00Z"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+    # 负的 / 非数值 max_markup → 统一 INVALID_REQUEST
+    r = post_audit(client, "MF-X", peer_contract_nos=["P"],
+                   **{**base, "max_markup": -0.01})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+    r = post_audit(client, "MF-X", peer_contract_nos=["P"],
+                   **{**base, "max_markup": "lots"})
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+    # 缺必填字段 / 空合同号 / 时间格式非法 → INVALID_REQUEST
+    for bad in [
+        {"peer_contract_nos": ["P"], **{k: v for k, v in base.items() if k != "known_at"}},
+        {"peer_contract_nos": ["P"], **{k: v for k, v in base.items() if k != "to"}},
+        {**base},  # 缺 peer_contract_nos
+        {"peer_contract_nos": [""], **base},
+        {"peer_contract_nos": ["P"], **{**base, "known_at": "not-a-date"}},
+    ]:
+        r = post_audit(client, "MF-X", **bad)
+        assert r.status_code == 422, r.text
+        assert r.json()["code"] == "INVALID_REQUEST"
+
+
+def test_mfa_is_read_only(client):
+    """审计全程只读：版本、血缘边与锁记录数量均不变化（含 inconclusive 场景）。"""
+    post_rate(client, contract_no="MF-12", rate=0.10,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    post_rate(client, contract_no="MF-12-P", rate=0.08,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2026-06-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+
+    def counts():
+        with sqlite3.connect(db) as conn:
+            return {
+                "versions": conn.execute(
+                    "SELECT COUNT(*) FROM rate_versions").fetchone()[0],
+                "edges": conn.execute(
+                    "SELECT COUNT(*) FROM rate_version_edges").fetchone()[0],
+                "locks": conn.execute(
+                    "SELECT COUNT(*) FROM rate_locks").fetchone()[0],
+            }
+
+    before = counts()
+    timeline_before = client.get("/contracts/MF-12/timeline").json()
+    for _ in range(2):
+        r = post_audit(client, "MF-12", peer_contract_nos=["MF-12-P"],
+                       **{"from": "2026-01-01T00:00:00Z", "to": "2027-06-01T00:00:00Z"},
+                       known_at="2026-06-01T00:00:00Z", max_markup=0.0)
+        assert r.status_code == 200
+    # 拒绝输入同样不写库
+    post_audit(client, "MF-12", peer_contract_nos=[],
+               **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
+               known_at="2026-06-01T00:00:00Z", max_markup=0.0)
+    assert counts() == before
+    assert client.get("/contracts/MF-12/timeline").json() == timeline_before
