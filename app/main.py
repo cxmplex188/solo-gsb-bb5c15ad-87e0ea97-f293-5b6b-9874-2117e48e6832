@@ -3,13 +3,13 @@
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from . import logic
 from .db import init_db
@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.6.0",
-    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演（不写库）签发 state_token，POST /rates 携带 token 条件提交，保证预演与正式提交结果一致。",
+    version="1.7.0",
+    description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史；版本血缘以可审计的 supersedes / retained_from 边记录；结算期费率锁保证锁定窗口内费率不再被修订；费率修订预演（不写库）签发 state_token，POST /rates 携带 token 条件提交，保证预演与正式提交结果一致；最惠价合规审计按同一认知时点比较目标与同业合同费率，逐段判定 compliant / violation / inconclusive（全程只读）。",
     lifespan=lifespan,
 )
 
@@ -200,6 +200,77 @@ class ChargePreviewResponse(BaseModel):
     status: str = Field(description="ok / rejected（任一行含 gap/conflict 段，总额被拒绝）")
     total_amount: Optional[float] = Field(default=None, description="全部行费用合计；rejected 时为 null")
     lines: list[ChargeLineView]
+
+
+class MostFavoredAuditRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    peer_contract_nos: list[Annotated[str, StringConstraints(min_length=1, max_length=128)]] = Field(
+        description="同业合同号列表：至少一个，不得含目标合同，不得重复"
+    )
+    from_: datetime = Field(alias="from", description="审计窗口起点（含），ISO-8601")
+    to: datetime = Field(description="审计窗口终点（不含），ISO-8601")
+    known_at: Optional[datetime] = Field(
+        default=None, description="认知时点，缺省为当前时间；目标与全部同业共用同一时点"
+    )
+    max_markup: float = Field(description="允许的最大加价幅度（非负有限数值，如 0.1 表示 10%）")
+
+
+class AuditIssueView(BaseModel):
+    contract_no: str = Field(description="出现问题的合同号（目标或同业）")
+    issue: str = Field(description="gap / conflict")
+    candidates: list[ChargeCandidate] = Field(
+        default_factory=list, description="仅 conflict：该合同在该段的全部候选版本"
+    )
+
+
+class BenchmarkView(BaseModel):
+    contract_no: str = Field(description="benchmark 来源同业合同（并列最低时取同业列表中靠前者）")
+    rate_id: int = Field(description="benchmark 命中的同业费率版本 id")
+    rate: float = Field(description="同业最低费率")
+
+
+class MostFavoredSegmentView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    status: str = Field(description="compliant / violation / inconclusive")
+    duration_us: int = Field(description="该片段的持续时长（微秒）")
+    target_basis: Optional[VersionView] = Field(
+        default=None, description="可判定时目标合同命中的唯一版本依据；inconclusive 时为 null"
+    )
+    benchmark: Optional[BenchmarkView] = Field(
+        default=None, description="可判定时的同业最低费率基准；inconclusive 时为 null"
+    )
+    threshold_rate: Optional[float] = Field(
+        default=None, description="违规阈值 = benchmark × (1 + max_markup)；inconclusive 时为 null"
+    )
+    reasons: list[AuditIssueView] = Field(
+        default_factory=list,
+        description="inconclusive 时的全部原因（目标在前，同业按输入顺序）；可判定时为空",
+    )
+
+
+class MostFavoredSummary(BaseModel):
+    compliant_us: int = Field(description="compliant 片段的总时长（微秒）")
+    violation_us: int = Field(description="violation 片段的总时长（微秒）")
+    inconclusive_us: int = Field(description="inconclusive 片段的总时长（微秒）")
+
+
+class MostFavoredAuditResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    contract_no: str
+    peer_contract_nos: list[str] = Field(description="实际使用的同业合同列表（输入原顺序）")
+    from_: str = Field(alias="from", description="审计窗口起点（含）")
+    to: str = Field(description="审计窗口终点（不含）")
+    known_at: str = Field(description="实际使用的认知时点")
+    max_markup: float
+    segments: list[MostFavoredSegmentView]
+    summary: MostFavoredSummary = Field(
+        description="各状态持续微秒数汇总（三个字段恒存在，合计等于窗口总时长）"
+    )
 
 
 class RateLockCreate(BaseModel):
@@ -667,6 +738,67 @@ def charge_preview(contract_no: str, payload: ChargePreviewRequest):
         status="ok" if result["ok"] else "rejected",
         total_amount=result["total_amount"],
         lines=result["lines"],
+    )
+
+
+@app.post("/contracts/{contract_no}/most-favored-audit", response_model=MostFavoredAuditResponse)
+def most_favored_audit(contract_no: str, payload: MostFavoredAuditRequest):
+    """最惠价合规审计（全程只读）：按同一 known_at 读取目标与同业合同的可见费率，
+    以所有业务边界的并集把 [from, to) 切为连续片段；目标与全部同业均唯一覆盖时，
+    以同业最低费率为 benchmark，目标费率超过 benchmark × (1 + max_markup) 判
+    violation、否则 compliant；任一合同 gap/conflict 判 inconclusive 并列出原因。
+    状态与判定依据完全相同的相邻段合并，并按状态汇总持续微秒数。"""
+    try:
+        result = logic.compute_most_favored_audit(
+            contract_no=contract_no,
+            peer_contract_nos=payload.peer_contract_nos,
+            from_dt=payload.from_,
+            to_dt=payload.to,
+            known_at=payload.known_at,
+            max_markup=payload.max_markup,
+        )
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.InvalidMarkupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_MARKUP", "message": str(exc)},
+        )
+    except logic.InvalidPeerContractsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": exc.code, "message": str(exc)},
+        )
+    return MostFavoredAuditResponse(
+        contract_no=contract_no,
+        peer_contract_nos=payload.peer_contract_nos,
+        from_=iso(payload.from_),
+        to=iso(payload.to),
+        known_at=result["known_at"],
+        max_markup=payload.max_markup,
+        segments=[
+            MostFavoredSegmentView(
+                from_=seg["from"],
+                to=seg["to"],
+                status=seg["status"],
+                duration_us=seg["duration_us"],
+                target_basis=(
+                    to_view(seg["target_basis"])
+                    if seg["target_basis"] is not None
+                    else None
+                ),
+                benchmark=(
+                    BenchmarkView(**seg["benchmark"]) if seg["benchmark"] else None
+                ),
+                threshold_rate=seg["threshold_rate"],
+                reasons=[AuditIssueView(**r) for r in seg["reasons"]],
+            )
+            for seg in result["segments"]
+        ],
+        summary=MostFavoredSummary(**result["summary"]),
     )
 
 

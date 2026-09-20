@@ -80,6 +80,14 @@ docker compose up --build
 集合与锁集合自预演以来未变化才真正落库，否则 `409 STALE_REVISION_PREVIEW`、
 不写任何数据。令牌事实上一次性：成功提交后合同状态即变，同一 token 再用即失效。
 
+**最惠价合规审计（v1.7 起）**：`POST /contracts/{contract_no}/most-favored-audit`
+按**同一认知时点** `known_at` 读取目标合同与若干同业合同的可见费率，以**所有合同
+业务边界的并集**把审计窗口 `[from, to)` 切为连续片段：目标与全部同业均唯一覆盖时，
+以**同业最低费率**为 benchmark，目标费率超过 `benchmark × (1 + max_markup)` 判
+`violation`、否则判 `compliant`；任一合同在该段出现 `gap` / `conflict` 时判
+`inconclusive` 并逐条列出原因（**绝不错判合规**）。状态与判定依据完全相同的相邻段
+自动合并，并按状态汇总持续微秒数。审计**全程只读**，不产生任何写入。
+
 ## 接口
 
 ### 1. 录入 / 修订费率 — `POST /rates`
@@ -571,6 +579,82 @@ curl -X POST http://localhost:8000/rates \
 }
 ```
 
+### 11. 最惠价合规审计 — `POST /contracts/{contract_no}/most-favored-audit`
+
+```bash
+curl -X POST http://localhost:8000/contracts/HT-2026-001/most-favored-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "peer_contract_nos": ["HT-2026-002", "HT-2026-003"],
+        "from": "2026-01-01T00:00:00Z",
+        "to":   "2027-01-01T00:00:00Z",
+        "known_at": "2026-06-01T00:00:00Z",
+        "max_markup": 0.25
+      }'
+```
+
+- 请求体：`peer_contract_nos`（同业合同号列表）、`from` / `to`（审计窗口，
+  左闭右开）、`max_markup`（允许的最大加价幅度，**非负有限数值**，如 `0.25`
+  表示 25%）必填；`known_at` 可选，缺省为当前时间，目标与全部同业**共用同一
+  认知时点**。接口**全程只读**，不产生任何写入。
+- 切分：以目标及全部同业在该时点可见版本的**业务边界并集**把窗口切为连续片段。
+- 逐段判定（`segments[]`）：
+
+| `status` | 含义 | 附带字段 |
+|---|---|---|
+| `compliant` | 目标与全部同业均唯一覆盖，且目标费率 ≤ `benchmark × (1 + max_markup)` | `target_basis`、`benchmark`、`threshold_rate` |
+| `violation` | 均唯一覆盖，但目标费率**严格大于** `benchmark × (1 + max_markup)` | 同上 |
+| `inconclusive` | 任一合同在该段 `gap` / `conflict`，无法判定（**不会误判合规**） | `reasons`：问题合同与原因列表 |
+
+- `benchmark` 为该段**同业最低费率**及其来源版本（并列最低时取同业列表中
+  靠前者）；`threshold_rate = benchmark.rate × (1 + max_markup)`。
+- `reasons[]` 目标合同在前、同业按输入顺序，每条含 `contract_no`、`issue`
+  （`gap` / `conflict`）；`conflict` 附全部候选版本（`rate_id` / `rate` / `version`）。
+- **状态与判定依据完全相同的相邻段合并**（compliant/violation 的依据为目标版本
+  与 benchmark 版本；inconclusive 的依据为原因列表），每段附 `duration_us`；
+  `summary` 按状态汇总持续微秒数（三个 `*_us` 字段恒存在，合计等于窗口总时长）。
+- 目标或同业合同不存在（或该认知时点无可见版本）时不报 404，相应片段自然得到
+  `inconclusive`（原因 `gap`）。
+
+校验规则（均返回 422 及稳定错误码）：
+
+| 情形 | `code` |
+|---|---|
+| `peer_contract_nos` 为空 | `EMPTY_PEER_CONTRACTS` |
+| 目标合同混入同业列表 | `TARGET_IN_PEER_CONTRACTS` |
+| 同业列表含重复合同 | `DUPLICATE_PEER_CONTRACT` |
+| `max_markup` 为负或非有限数值 | `INVALID_MARKUP` |
+| `from >= to` | `INVALID_INTERVAL` |
+| 缺必填字段 / 同业合同号为空串 / 时间格式非法 | `INVALID_REQUEST` |
+
+响应示例（上半年目标 0.06 超过 benchmark 0.04 × 1.25 = 0.05 判 `violation`，
+下半年同业提价后合规）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "peer_contract_nos": ["HT-2026-002", "HT-2026-003"],
+  "from": "2026-01-01T00:00:00.000000+00:00",
+  "to": "2027-01-01T00:00:00.000000+00:00",
+  "known_at": "2026-06-01T00:00:00.000000+00:00",
+  "max_markup": 0.25,
+  "segments": [
+    {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-07-01T00:00:00.000000+00:00",
+     "status": "violation", "duration_us": 15638400000000,
+     "target_basis": {"rate_id": 1, "rate": 0.06, "version": 1, "...": "..."},
+     "benchmark": {"contract_no": "HT-2026-002", "rate_id": 2, "rate": 0.04},
+     "threshold_rate": 0.05, "reasons": []},
+    {"from": "2026-07-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+     "status": "compliant", "duration_us": 15897600000000,
+     "target_basis": {"rate_id": 1, "rate": 0.06, "version": 1, "...": "..."},
+     "benchmark": {"contract_no": "HT-2026-002", "rate_id": 3, "rate": 0.055},
+     "threshold_rate": 0.06875, "reasons": []}
+  ],
+  "summary": {"compliant_us": 15897600000000, "violation_us": 15638400000000,
+              "inconclusive_us": 0}
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -585,7 +669,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁）
+  logic.py     双时态核心逻辑（追加式录入、修订预演与条件提交、时点查询、时间线、覆盖率分段、计费预览、变更对比、版本血缘 DAG、结算期费率锁、最惠价合规审计）
   db.py        SQLite 连接与自动建表（rate_versions + rate_version_edges 血缘边 + rate_locks 费率锁）
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

@@ -15,6 +15,11 @@ supersedes 边，补偿片段对其来源旧版本建立 retained_from 边；边
 （_plan_rate_revision：锁相交优先 → recorded_at 单调性 → 部分重叠补偿 → 版本号
 递增）；预演全程只读并签发 state_token，携带 token 的提交仅当合同当前版本集合
 与锁集合自预演以来未变化时才落库，否则整体拒绝、不写任何数据。
+
+最惠价合规审计（compute_most_favored_audit）按同一认知时点读取目标合同与
+同业合同的可见费率，以全部业务边界的并集切分审计窗口：目标与所有同业均唯一
+覆盖时，以同业最低费率为 benchmark 判定 compliant / violation；任一合同出现
+gap / conflict 时判 inconclusive 并列出原因，绝不错判合规。审计全程只读。
 """
 
 import base64
@@ -91,6 +96,22 @@ class InvalidStateTokenError(ValueError):
 
 class StaleRevisionPreviewError(ValueError):
     """携带 state_token 提交时，相关当前版本或锁集合在预演后已变化，预演失效。"""
+
+
+class InvalidMarkupError(ValueError):
+    """max_markup 为负数或非有限数值。"""
+
+
+class InvalidPeerContractsError(ValueError):
+    """同业合同列表非法：为空、混入目标合同或含重复合同。
+
+    code 为稳定错误码：EMPTY_PEER_CONTRACTS / TARGET_IN_PEER_CONTRACTS /
+    DUPLICATE_PEER_CONTRACT。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def _normalize_revision(
@@ -1012,3 +1033,173 @@ def compute_charge_preview(
         "total_amount": round(total, CHARGE_SCALE) if all_ok else None,
         "lines": out_lines,
     }
+
+
+# ---------- 最惠价合规审计 ----------
+
+def _validate_peer_contracts(
+    contract_no: str, peer_contract_nos: list[str]
+) -> list[str]:
+    """校验同业合同列表：非空、不含目标合同、无重复；按输入原顺序返回。"""
+    if not peer_contract_nos:
+        raise InvalidPeerContractsError(
+            "EMPTY_PEER_CONTRACTS", "peer_contract_nos 至少需要一个同业合同"
+        )
+    if contract_no in peer_contract_nos:
+        raise InvalidPeerContractsError(
+            "TARGET_IN_PEER_CONTRACTS",
+            f"目标合同 '{contract_no}' 不得混入同业合同列表",
+        )
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for peer in peer_contract_nos:
+        if peer in seen and peer not in duplicates:
+            duplicates.append(peer)
+        seen.add(peer)
+    if duplicates:
+        raise InvalidPeerContractsError(
+            "DUPLICATE_PEER_CONTRACT",
+            f"同业合同列表含重复合同：{', '.join(sorted(duplicates))}",
+        )
+    return list(peer_contract_nos)
+
+
+def _issue_entry(
+    contract_no: str, issue: str, candidates: list[sqlite3.Row]
+) -> dict:
+    """inconclusive 原因条目：问题合同 + gap/conflict；conflict 附全部候选版本。"""
+    return {
+        "contract_no": contract_no,
+        "issue": issue,
+        "candidates": [
+            {"rate_id": r["id"], "rate": r["rate"], "version": r["version"]}
+            for r in candidates
+        ]
+        if issue == "conflict"
+        else [],
+    }
+
+
+def compute_most_favored_audit(
+    contract_no: str,
+    peer_contract_nos: list[str],
+    from_dt: datetime,
+    to_dt: datetime,
+    known_at: Optional[datetime],
+    max_markup: float,
+) -> dict:
+    """最惠价合规审计：按同一认知时点比较目标合同与同业合同费率（全程只读）。
+
+    以目标及全部同业合同在 known_at 时点可见版本的业务区间边界的**并集**把
+    窗口 [from, to) 切为连续片段，逐段判定：
+
+    - 目标与所有同业均唯一覆盖（covered）：以同业最低费率为 benchmark
+      （并列最低时取同业列表中靠前者），目标费率 > benchmark × (1 + max_markup)
+      判 violation，否则 compliant；
+    - 任一合同 gap / conflict：判 inconclusive，reasons 逐条列出问题合同与
+      原因（目标在前，同业按输入顺序；conflict 附全部候选），绝不错判合规。
+
+    状态与判定依据（compliant/violation：目标版本与 benchmark 版本；
+    inconclusive：原因列表）完全相同的相邻段合并为一段；summary 汇总各状态的
+    持续微秒数（三个 *_us 字段恒存在，合计等于窗口总时长）。
+
+    返回 {"known_at", "segments", "summary"}。
+    """
+    f = iso(from_dt)
+    t = iso(to_dt)
+    if f >= t:
+        raise InvalidIntervalError("from 必须早于 to")
+    if not math.isfinite(max_markup) or max_markup < 0:
+        raise InvalidMarkupError(f"max_markup 必须是非负有限数值，收到 {max_markup!r}")
+    peers = _validate_peer_contracts(contract_no, peer_contract_nos)
+    ka = iso(known_at) if known_at is not None else now_iso()
+
+    conn = connect()
+    try:
+        # 同一连接读取目标与全部同业，保证审计基于同一快照；全程只读。
+        target_clipped = _visible_clipped(contract_no, f, t, ka, conn=conn)
+        peer_clipped = [
+            (peer, _visible_clipped(peer, f, t, ka, conn=conn)) for peer in peers
+        ]
+    finally:
+        conn.close()
+
+    # 目标与全部同业可见版本业务区间边界的并集（含窗口端点）切分 [f, t)
+    bounds = sorted({
+        f,
+        t,
+        *(p for s, e, _ in target_clipped for p in (s, e)),
+        *(p for _, clipped in peer_clipped for s, e, _ in clipped for p in (s, e)),
+    })
+
+    segments = []
+    summary = {"compliant_us": 0, "violation_us": 0, "inconclusive_us": 0}
+    last_key = None  # 上一段的判定依据（状态 + 目标/benchmark 版本或原因列表）
+    for seg_from, seg_to in zip(bounds, bounds[1:]):
+        duration = _duration_us(seg_from, seg_to)
+        target_candidates = _candidates_at(target_clipped, seg_from, seg_to)
+        peer_candidates = [
+            (peer, _candidates_at(clipped, seg_from, seg_to))
+            for peer, clipped in peer_clipped
+        ]
+
+        # inconclusive 原因：目标在前，同业按输入顺序；conflict 附全部候选
+        reasons = []
+        target_status = _coverage_status(target_candidates)
+        if target_status != "covered":
+            reasons.append(_issue_entry(contract_no, target_status, target_candidates))
+        for peer, candidates in peer_candidates:
+            peer_status = _coverage_status(candidates)
+            if peer_status != "covered":
+                reasons.append(_issue_entry(peer, peer_status, candidates))
+
+        if reasons:
+            status = "inconclusive"
+            target_basis = None
+            benchmark = None
+            threshold = None
+            key = (
+                status,
+                tuple(
+                    (
+                        r["contract_no"],
+                        r["issue"],
+                        tuple(c["rate_id"] for c in r["candidates"]),
+                    )
+                    for r in reasons
+                ),
+            )
+        else:
+            target_basis = target_candidates[0]
+            benchmark_peer, benchmark_row = min(
+                ((peer, candidates[0]) for peer, candidates in peer_candidates),
+                key=lambda item: item[1]["rate"],
+            )
+            benchmark = {
+                "contract_no": benchmark_peer,
+                "rate_id": benchmark_row["id"],
+                "rate": benchmark_row["rate"],
+            }
+            threshold = benchmark_row["rate"] * (1 + max_markup)
+            status = "violation" if target_basis["rate"] > threshold else "compliant"
+            key = (status, target_basis["id"], benchmark["rate_id"])
+
+        summary[f"{status}_us"] += duration
+        if key == last_key:
+            segments[-1]["to"] = seg_to
+            segments[-1]["duration_us"] += duration
+        else:
+            segments.append(
+                {
+                    "from": seg_from,
+                    "to": seg_to,
+                    "status": status,
+                    "duration_us": duration,
+                    "target_basis": target_basis,
+                    "benchmark": benchmark,
+                    "threshold_rate": threshold,
+                    "reasons": reasons,
+                }
+            )
+            last_key = key
+    return {"known_at": ka, "segments": segments, "summary": summary}
